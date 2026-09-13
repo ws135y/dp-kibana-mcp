@@ -5,7 +5,7 @@
 ## 已提供工具
 
 - `check_connection`：验证 Kibana 地址与登录态。
-- `search_logs`：按关键词、时间范围、索引和精确字段查询，自动使用 `search_after` 分页并去重。
+- `search_logs`：按关键词、时间范围、索引和精确字段查询，自动分页并去重。
 - `get_trace_logs`：按 traceId 查询链路日志。
 - `get_log_context`：查询某时间点前后的日志。
 - `aggregate_logs`：按服务、级别、主机等字段统计。

@@ -120,11 +120,19 @@ class KibanaClient:
                     )
                 return payload
         except HTTPError as exc:
+            error_body = ""
+            try:
+                decoded = exc.read().decode("utf-8")
+                parsed = json.loads(decoded)
+                error_body = json.dumps(_redact(parsed), ensure_ascii=False)[:2000]
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                error_body = ""
             if exc.code in (401, 403):
                 raise KibanaRequestError(
                     f"Kibana 权限验证失败（HTTP {exc.code}），登录态无效或已过期，请更新 KIBANA_SID"
                 ) from exc
-            raise KibanaRequestError(f"Kibana 查询失败（HTTP {exc.code}）") from exc
+            suffix = f"，响应：{error_body}" if error_body else ""
+            raise KibanaRequestError(f"Kibana 查询失败（HTTP {exc.code}{suffix}）") from exc
         except URLError as exc:
             raise KibanaRequestError(f"无法连接 Kibana：{exc.reason}") from exc
         except TimeoutError as exc:
@@ -294,10 +302,13 @@ def _build_params(
     source_fields: Iterable[str],
     sort_order: str,
     aggs: Optional[Dict[str, Any]] = None,
-    search_after: Optional[List[Any]] = None,
+    preference: Optional[str] = None,
+    from_offset: int = 0,
 ) -> Dict[str, Any]:
     _validate_name(index, "index")
     _validate_name(time_field, "time_field", allow_comma=False)
+    if from_offset < 0:
+        raise ValueError("from_offset 不能小于 0")
     if sort_order not in ("asc", "desc"):
         raise ValueError("sort_order 只能是 asc 或 desc")
     fields = []
@@ -309,10 +320,7 @@ def _build_params(
         fields.append(spec)
     body: Dict[str, Any] = {
         "size": size,
-        "sort": [
-            {time_field: {"order": sort_order, "unmapped_type": "boolean"}},
-            {"_shard_doc": {"order": "asc"}},
-        ],
+        "sort": [{time_field: {"order": sort_order, "unmapped_type": "boolean"}}],
         "track_total_hits": True,
         "fields": fields,
         "stored_fields": ["*"],
@@ -322,12 +330,12 @@ def _build_params(
     }
     if aggs:
         body["aggs"] = aggs
-    if search_after is not None:
-        body["search_after"] = search_after
+    if from_offset:
+        body["from"] = from_offset
     return {
         "index": index,
         "body": body,
-        "preference": str(uuid.uuid4().int),
+        "preference": preference or str(uuid.uuid4().int),
     }
 
 
@@ -359,7 +367,8 @@ def _run_paginated_search(
     """Fetch all pages using search_after and merge results without duplicates."""
     page_size = _clean_size(page_size)
     max_results = _clean_max_results(max_results)
-    search_after: Optional[List[Any]] = None
+    from_offset = 0
+    preference = f"mcp-pagination-{uuid.uuid4().hex}"
     logs: List[Dict[str, Any]] = []
     seen = set()
     total = 0
@@ -370,7 +379,8 @@ def _run_paginated_search(
         raw = _run_search(
             **kwargs,
             size=min(page_size, max_results - len(logs)),
-            search_after=search_after,
+            preference=preference,
+            from_offset=from_offset,
         )
         page = _search_response(raw)
         pages += 1
@@ -387,12 +397,9 @@ def _run_paginated_search(
             if len(logs) >= max_results:
                 break
 
-        if not page_logs or len(logs) >= total or len(logs) >= max_results:
+        from_offset += len(page_logs)
+        if not page_logs or from_offset >= total or len(logs) >= total or len(logs) >= max_results:
             break
-        next_search_after = page_logs[-1].get("_sort")
-        if not isinstance(next_search_after, list) or next_search_after == search_after:
-            raise KibanaRequestError("分页响应缺少有效的 search_after 排序值")
-        search_after = next_search_after
 
     return {
         "ok": True,

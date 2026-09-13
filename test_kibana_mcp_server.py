@@ -68,7 +68,7 @@ class KibanaMcpServerTests(unittest.TestCase):
         self.assertEqual("test", payload["searches"][0]["body"]["query"]["bool"]["must"][0]["multi_match"]["query"])
         self.assertNotIn("mcp-", json.dumps(payload))
 
-    def test_builds_search_after_for_next_page(self):
+    def test_builds_from_offset_for_next_page(self):
         params = server._build_params(
             index="logstash-filebeat-*",
             query="test",
@@ -79,13 +79,10 @@ class KibanaMcpServerTests(unittest.TestCase):
             size=50,
             source_fields=["@timestamp", "message"],
             sort_order="desc",
-            search_after=["2026-09-13T03:00:00.000Z", 12345],
+            from_offset=50,
         )
-        self.assertEqual(
-            ["2026-09-13T03:00:00.000Z", 12345],
-            params["body"]["search_after"],
-        )
-        self.assertEqual("_shard_doc", list(params["body"]["sort"][1])[0])
+        self.assertEqual(50, params["body"]["from"])
+        self.assertEqual(1, len(params["body"]["sort"]))
 
 
 if __name__ == "__main__":
