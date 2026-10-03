@@ -26,6 +26,9 @@ async def main() -> None:
         async with ClientSession(read_stream, write_stream) as session:
             server_info = await session.initialize()
             tools = await session.list_tools()
+            names = {tool.name for tool in tools.tools}
+            required = {"check_connection", "search_logs", "get_trace_logs", "get_log_context", "aggregate_logs", "analyze_latency"}
+            assert required <= names, f"Missing MCP tools: {required - names}"
             print(f"MCP handshake: OK ({server_info.server_info.name})")
             print("Tool names:", ", ".join(tool.name for tool in tools.tools))
 

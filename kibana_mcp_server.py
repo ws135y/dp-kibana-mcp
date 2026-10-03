@@ -7,6 +7,7 @@ requests to Kibana's internal msearch endpoint using a configured ``sid`` cookie
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -22,7 +23,7 @@ from mcp.server import MCPServer
 
 
 MAX_RESULTS = 200
-MAX_PAGINATED_RESULTS = 1000
+MAX_PAGINATED_RESULTS = 5000
 DEFAULT_SOURCE_FIELDS = ["@timestamp", "level", "appname", "traceId", "message", "host.name"]
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_@.*?,:+-]+$")
 DATE_MATH = re.compile(r"now(?:[+-]\d+[smhdwMy])?(?:/[smhdwMy])?")
@@ -32,6 +33,10 @@ SENSITIVE_VALUE = re.compile(
 )
 SENSITIVE_BRACKET_VALUE = re.compile(
     r"(?i)(\b(?:authorization|cookie|password|secret|token|sid)\b\s*[【\[])(.*?)([】\]])"
+)
+RESPONSE_LATENCY = re.compile(
+    r"\bREP\s+\d+b\s+(?P<status>\d{3})\s+(?P<duration>\d+(?:\.\d+)?)ms\s+"
+    r"(?P<method>GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(?P<path>\S+)"
 )
 
 
@@ -364,7 +369,7 @@ def _run_paginated_search(
     max_results: int,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    """Fetch all pages using search_after and merge results without duplicates."""
+    """Fetch pages using from/size, up to max_results, and deduplicate hits."""
     page_size = _clean_size(page_size)
     max_results = _clean_max_results(max_results)
     from_offset = 0
@@ -401,13 +406,22 @@ def _run_paginated_search(
         if not page_logs or from_offset >= total or len(logs) >= total or len(logs) >= max_results:
             break
 
+    truncated = total > len(logs)
+    warnings = []
+    if truncated:
+        warnings.append(f"查询结果不完整：匹配 {total} 条，返回 {len(logs)} 条，本次上限 {max_results} 条。")
+    if timed_out:
+        warnings.append("Kibana 查询超时，返回结果可能不完整。")
     return {
         "ok": True,
         "total": total,
         "returned": len(logs),
         "pages": pages,
-        "truncated": total > len(logs),
+        "max_results": max_results,
+        "truncated": truncated,
         "timed_out": timed_out,
+        "complete": not truncated and not timed_out,
+        "warnings": warnings,
         "logs": logs,
     }
 
@@ -447,9 +461,13 @@ def search_logs(
     size: int = 50,
     source_fields: Optional[List[str]] = None,
     sort_order: str = "desc",
-    max_results: int = 1000,
+    max_results: int = MAX_PAGINATED_RESULTS,
 ) -> Dict[str, Any]:
-    """通过 Kibana 查询日志。query 是短语匹配；filters 用于精确字段过滤。"""
+    """查询日志，自动分页至最多 5000 条。query 是短语匹配；filters 是精确字段过滤。
+
+    size 是每页条数（最多 200），max_results 是本次总上限（默认/最多 5000）。
+    超过上限时返回 truncated=true、complete=false 和 warnings。
+    """
     try:
         return _run_paginated_search(
             index=index or _default_index(),
@@ -463,6 +481,129 @@ def search_logs(
             page_size=size,
             max_results=max_results,
         )
+    except Exception as exc:
+        return _error(exc)
+
+
+def _latency_statistics(records: List[Dict[str, Any]], slow_threshold_ms: float) -> Dict[str, Any]:
+    durations = sorted(record["duration_ms"] for record in records)
+    count = len(durations)
+    statuses: Dict[str, int] = {}
+    for record in records:
+        status = str(record["status"])
+        statuses[status] = statuses.get(status, 0) + 1
+
+    def percentile(fraction: float) -> Optional[float]:
+        return durations[math.ceil(fraction * count) - 1] if count else None
+
+    return {
+        "count": count,
+        "min_ms": durations[0] if count else None,
+        "avg_ms": round(sum(durations) / count, 3) if count else None,
+        "p50_ms": percentile(0.50),
+        "p90_ms": percentile(0.90),
+        "p95_ms": percentile(0.95),
+        "max_ms": durations[-1] if count else None,
+        "slow_count": sum(duration >= slow_threshold_ms for duration in durations),
+        "error_count": sum(record["status"] >= 400 for record in records),
+        "status_counts": statuses,
+    }
+
+
+def _summarise_latency(result: Dict[str, Any], slow_threshold_ms: float) -> Dict[str, Any]:
+    records: List[Dict[str, Any]] = []
+    grouped: Dict[tuple, List[Dict[str, Any]]] = {}
+    for log in result["logs"]:
+        message = log.get("message")
+        match = RESPONSE_LATENCY.search(message) if isinstance(message, str) else None
+        if not match:
+            continue
+        path = match["path"]
+        path = urlparse(path).path if path.startswith(("http://", "https://")) else path.split("?", 1)[0]
+        record = {
+            "appname": str(log.get("appname") or "(missing)"),
+            "method": match["method"],
+            "path": path,
+            "status": int(match["status"]),
+            "duration_ms": float(match["duration"]),
+            "timestamp": log.get("@timestamp"),
+            "traceId": log.get("traceId"),
+        }
+        records.append(record)
+        key = (record["appname"], record["method"], record["path"])
+        grouped.setdefault(key, []).append(record)
+
+    groups = [
+        {"appname": appname, "method": method, "path": path, **_latency_statistics(items, slow_threshold_ms)}
+        for (appname, method, path), items in grouped.items()
+    ]
+    groups.sort(key=lambda group: (-group["max_ms"], group["appname"], group["method"], group["path"]))
+    warnings = list(result.get("warnings", []))
+    complete = not result["truncated"] and not result["timed_out"]
+    if not complete:
+        warnings.append("耗时统计仅基于已返回日志，不能代表全部匹配请求。")
+    if not records:
+        warnings.append("未找到可解析的 REP 响应耗时记录；其他日志格式不计入统计。")
+    return {
+        "ok": True,
+        "total_logs": result["total"],
+        "scanned_logs": result["returned"],
+        "response_count": len(records),
+        "skipped_logs": len(result["logs"]) - len(records),
+        "pages": result["pages"],
+        "max_results": result.get("max_results", MAX_PAGINATED_RESULTS),
+        "truncated": result["truncated"],
+        "timed_out": result["timed_out"],
+        "complete": complete,
+        "warnings": warnings,
+        "slow_threshold_ms": slow_threshold_ms,
+        "percentile_method": "nearest_rank",
+        "overall": _latency_statistics(records, slow_threshold_ms),
+        "groups": groups,
+        "slowest": sorted(records, key=lambda record: record["duration_ms"], reverse=True)[:10],
+    }
+
+
+@server.tool()
+def analyze_latency(
+    query: str = "",
+    index: Optional[str] = None,
+    start_time: Optional[str] = "now-1h",
+    end_time: Optional[str] = "now",
+    time_field: str = "@timestamp",
+    filters: Optional[Dict[str, Any]] = None,
+    size: int = 200,
+    max_results: int = MAX_PAGINATED_RESULTS,
+    slow_threshold_ms: float = 1000,
+) -> Dict[str, Any]:
+    """按服务、HTTP 方法和接口汇总 REP 响应日志耗时，单位毫秒。
+
+    返回响应数、平均/P50/P90/P95/最大耗时、状态码及最慢十条的 traceId。
+    仅解析 REP <bytes>b <status> <duration>ms <method> <path> 格式。
+    自动分页至最多 5000 条匹配日志（含非响应日志），不返回原始日志正文。
+    complete=false 时为部分日志统计；HTTP 错误响应也计入耗时。
+    """
+    try:
+        if not math.isfinite(slow_threshold_ms) or slow_threshold_ms < 0:
+            raise ValueError("slow_threshold_ms 必须是大于等于 0 的有限数字")
+        result = search_logs(
+            query=query,
+            index=index,
+            start_time=start_time,
+            end_time=end_time,
+            time_field=time_field,
+            filters=filters,
+            size=size,
+            max_results=max_results,
+            source_fields=[time_field, "appname", "traceId", "message"],
+            sort_order="asc",
+        )
+        if not result.get("ok"):
+            return result
+        if time_field != "@timestamp":
+            result = dict(result)
+            result["logs"] = [{**log, "@timestamp": log.get(time_field)} for log in result["logs"]]
+        return _summarise_latency(result, slow_threshold_ms)
     except Exception as exc:
         return _error(exc)
 
